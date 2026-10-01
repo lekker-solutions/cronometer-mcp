@@ -5,6 +5,7 @@ from collections import namedtuple
 import pytest
 from unittest.mock import patch, MagicMock
 from datetime import date
+from pathlib import Path
 
 from cronometer_mcp.client import CronometerClient, EXPORT_TYPES, UNIVERSAL_MEASURE_ID
 
@@ -28,7 +29,11 @@ class TestClientInit:
                 CronometerClient()
 
     def test_reads_env_vars(self):
-        env = {"CRONOMETER_USERNAME": "env@test.com", "CRONOMETER_PASSWORD": "envpw"}
+        env = {
+            "CRONOMETER_USERNAME": "env@test.com",
+            "CRONOMETER_PASSWORD": "envpw",
+            "USERPROFILE": str(Path.home()),  # Windows has no home without it
+        }
         with patch.dict("os.environ", env, clear=True):
             c = CronometerClient()
             assert c.username == "env@test.com"
@@ -1837,3 +1842,153 @@ class TestDeleteRepeatItem:
         )
         with pytest.raises(RuntimeError, match="GWT-RPC call failed"):
             c.delete_repeat_item(999999)
+
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def _fixture(name: str) -> str:
+    return (FIXTURES / name).read_text(encoding="utf-8")
+
+
+class TestAddRecipe:
+    """addFood body and response, against a browser capture.
+
+    The fixtures are a recipe "asdfaefafe" (100 g oats 464877 + 50 g egg
+    464674) saved from the web app. Nonce, email, user id and the GWT strong
+    name are replaced by {placeholders}, which the client below is set to
+    send as-is.
+    """
+
+    OATS, EGG = 464877, 464674
+
+    def _make_client(self):
+        c = CronometerClient(username="{email}", password="pw")
+        c._authenticated = True
+        c.nonce = "{nonce}"
+        c.user_id = "{user_id}"
+        c.gwt_header = "{gwt_header}"
+        return c
+
+    def _add_recipe(self, c, ingredients, name="asdfaefafe", notes="afeafeaef"):
+        foods = {
+            self.OATS: _fixture("getfood_464877.txt"),
+            self.EGG: _fixture("getfood_464674.txt"),
+        }
+        sent = []
+
+        def post(body):
+            if "|getFood|" in body:
+                return foods[int(body.split("|")[-2])]
+            sent.append(body)
+            return _fixture("addfood_response.txt")
+
+        with patch.object(c, "_gwt_post", side_effect=post):
+            result = c.add_recipe(name, ingredients, notes)
+        return result, sent
+
+    def test_body_matches_browser_capture(self):
+        c = self._make_client()
+        result, sent = self._add_recipe(c, [
+            {"food_source_id": self.OATS, "grams": 100},
+            {"food_source_id": self.EGG, "grams": 50},
+        ])
+        assert sent == [_fixture("addfood_request.txt")]
+        assert result == {
+            "food_source_id": 84011882,
+            "total_grams": 150.0,
+            "kcal": 456.5,
+            "protein_g": 19.79,
+            "carbs_g": 69.22,
+            "fat_g": 11.195,
+        }
+
+    def test_single_ingredient_shifts_back_references(self):
+        c = self._make_client()
+        _, sent = self._add_recipe(c, [
+            {"food_source_id": self.OATS, "grams": 80},
+        ])
+        tokens = sent[0].split("|")
+        # Measure$Type and Nutrient$Type back-references move with the
+        # ingredient count: -(9 + n) and -(19 + n).
+        assert "-10" in tokens
+        assert "-20" in tokens
+        assert "-11" not in tokens
+        assert "-21" not in tokens
+
+    def test_empty_notes_sent_as_null(self):
+        c = self._make_client()
+        _, sent = self._add_recipe(c, [
+            {"food_source_id": self.OATS, "grams": 80},
+        ], notes="")
+        assert "afeafeaef" not in sent[0]
+
+    def test_no_ingredients_raises(self):
+        with pytest.raises(ValueError, match="at least one ingredient"):
+            self._make_client().add_recipe("empty", [])
+
+    def test_parse_add_food_response(self):
+        assert CronometerClient._parse_add_food(
+            _fixture("addfood_response.txt")
+        ) == 84011882
+
+    def test_parse_add_food_rejects_unexpected_response(self):
+        with pytest.raises(RuntimeError, match="not understood"):
+            CronometerClient._parse_add_food('//OK[1,2,3,["a"],0,7]')
+
+
+class TestParseGetFoodRecipeFields:
+    """default_measure_id and nutrients, against real getFood responses."""
+
+    def test_oats(self):
+        r = CronometerClient._parse_get_food(
+            _fixture("getfood_464877.txt"), 464877
+        )
+        assert r["default_measure_id"] == 1073268
+        assert r["nutrients"][208] == 379.0
+        assert r["nutrients"][-1205] == 58.26
+
+    def test_egg_default_measure_is_not_the_g_measure(self):
+        r = CronometerClient._parse_get_food(
+            _fixture("getfood_464674.txt"), 464674
+        )
+        assert r["default_measure_id"] == 1072101  # "large"
+        assert r["nutrients"][208] == 155.0
+
+    def test_invalid_response_has_empty_defaults(self):
+        r = CronometerClient._parse_get_food("//EX[error]", 1)
+        assert r["default_measure_id"] is None
+        assert r["nutrients"] == {}
+
+
+class TestDeleteRecipe:
+    def _make_client(self):
+        c = CronometerClient(username="test@x.com", password="pw")
+        c._authenticated = True
+        c.nonce = "n"
+        c.gwt_header = "AAAA"
+        c.session = MagicMock()
+        c.session.post = MagicMock(
+            return_value=MagicMock(
+                text="//OK[0,0,7]", raise_for_status=lambda: None
+            )
+        )
+        return c
+
+    def test_body_and_result(self):
+        c = self._make_client()
+        assert c.delete_recipe(84011882) is True
+        assert c.session.post.call_args[1]["data"] == (
+            "7|0|7|https://cronometer.com/cronometer/|AAAA|"
+            "com.cronometer.shared.rpc.CronometerService|"
+            "deleteFood|java.lang.String/2004016611|I|n|"
+            "1|2|3|4|2|5|6|7|84011882|"
+        )
+
+    def test_failure_raises(self):
+        c = self._make_client()
+        c.session.post.return_value = MagicMock(
+            text="//EX[not found]", raise_for_status=lambda: None
+        )
+        with pytest.raises(RuntimeError, match="GWT-RPC call failed"):
+            c.delete_recipe(1)

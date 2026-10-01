@@ -118,6 +118,15 @@ GWT_GET_FOOD = (
     "1|2|3|4|2|5|6|7|{food_source_id}|"
 )
 
+GWT_DELETE_FOOD = (
+    "7|0|7|https://cronometer.com/cronometer/|"
+    "{gwt_header}|"
+    "com.cronometer.shared.rpc.CronometerService|"
+    "deleteFood|java.lang.String/2004016611|"
+    "I|{nonce}|"
+    "1|2|3|4|2|5|6|7|{food_source_id}|"
+)
+
 GWT_GET_ALL_MACRO_SCHEDULES = (
     "7|0|7|https://cronometer.com/cronometer/|"
     "{gwt_header}|"
@@ -341,6 +350,22 @@ GWT_DELETE_REPEAT_ITEM = (
 # getAllMacroSchedules: 0=Sun, 1=Mon, ..., 6=Sat
 # saveMacroSchedule:   0=Mon, 1=Tue, ..., 6=Sun
 _US_TO_ISO_DOW = {0: 6, 1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5}
+
+# Nutrient ids the web app sends in addFood's NutrientMap, in the order it
+# sends them. Taken from one capture (RESEARCH-recipes-gwt-rpc.md): ids
+# the getFood response carries but the app left out (318, 325, 326) are
+# dropped, and the order is not numeric (-1205 first, the negative macro ids
+# and 10005 last), so it is reproduced from the list rather than sorted.
+_RECIPE_NUTRIENT_IDS = (
+    -1205, 203, 204, 205, 207, 208, 209, 210, 211, 212, 213, 214, 221,
+    246, 255, 262, 269, 287, 291, 295, 297, 301, 303, 304, 305, 306,
+    307, 309, 312, 315, 317, 319, 320, 321, 322, 323, 324, 334, 337,
+    338, 341, 342, 343, 401, 404, 405, 406, 410, 415, 417, 418, 421,
+    430, 501, 502, 503, 504, 505, 506, 507, 508, 509, 510, 511, 512,
+    513, 514, 515, 516, 517, 518, 601, 605, 606, 621, 629, 645, 646,
+    675, 851, 853, 10001, 10002, 10004, 10007, 10008, 10009, 10012,
+    -203, -205, -204, -221, 10005,
+)
 
 EXPORT_TYPES = {
     "servings": "servings",
@@ -1082,6 +1107,10 @@ class CronometerClient:
               - ``description`` (str): Human-readable description
                 (e.g. ``"1 large - 50g"``).
               - ``weight_grams`` (float): Weight in grams for this measure.
+            - ``default_measure_id`` (int | None): Id of the food's default
+              measure.
+            - ``nutrients`` (dict[int, float]): Nutrient id to amount per
+              100 g.
         """
         self.authenticate()
         body = (
@@ -1114,6 +1143,8 @@ class CronometerClient:
         result: dict = {
             "food_source_id": food_source_id,
             "measures": [],
+            "default_measure_id": None,
+            "nutrients": {},
         }
 
         if not raw.startswith("//OK[") or not raw.endswith(",0,7]"):
@@ -1218,7 +1249,232 @@ class CronometerClient:
             })
 
         result["measures"] = measures
+
+        # The food's default measure id sits just before the FoodMeasures
+        # type ref, which is followed by a quoted (base64) long. It is the
+        # measure the web app records on a recipe ingredient (the amount
+        # itself is in grams).
+        fm_idx = next(
+            (idx + 1 for idx, entry in enumerate(string_table)
+             if entry.startswith("com.cronometer.shared.foods.models.FoodMeasures/")),
+            None,
+        )
+        for i in range(1, len(tokens) - 1):
+            if (tokens[i] == fm_idx and isinstance(tokens[i - 1], int)
+                    and isinstance(tokens[i + 1], str)):
+                result["default_measure_id"] = tokens[i - 1]
+                break
+
+        # Each Nutrient entry reads: Nutrient$Type ref or back-ref, id,
+        # amount per 100 g, Nutrient ref, id, Integer ref.
+        int_idx = nutrient_idx = None
+        for idx, entry in enumerate(string_table):
+            if entry.startswith("java.lang.Integer/"):
+                int_idx = idx + 1
+            elif entry.startswith("com.cronometer.shared.foods.models.Nutrient/"):
+                nutrient_idx = idx + 1
+        if int_idx and nutrient_idx:
+            for i in range(len(tokens) - 5):
+                if (tokens[i + 3] == nutrient_idx and tokens[i + 5] == int_idx
+                        and tokens[i + 1] == tokens[i + 4]
+                        and isinstance(tokens[i + 1], int)
+                        and isinstance(tokens[i + 2], float)):
+                    result["nutrients"][tokens[i + 1]] = tokens[i + 2]
         return result
+
+    def add_recipe(
+        self,
+        name: str,
+        ingredients: list[dict],
+        notes: str = "",
+    ) -> dict:
+        """Create a recipe from a list of ingredients, amounts in grams.
+
+        Calls getFood once per ingredient, sums each nutrient over the
+        ingredients, and saves the result with addFood the way the web app
+        does. Nothing server-side computes the recipe's nutrients.
+
+        Args:
+            name: Recipe name.
+            ingredients: ``[{"food_source_id": int, "grams": float}, ...]``.
+            notes: Optional recipe notes.
+
+        Returns:
+            Dict with ``food_source_id`` (int, the new recipe), ``total_grams``,
+            ``kcal``, ``protein_g``, ``carbs_g`` and ``fat_g`` (whole recipe).
+        """
+        if not ingredients:
+            raise ValueError("A recipe needs at least one ingredient")
+        self.authenticate()
+
+        foods = []
+        for ing in ingredients:
+            food_source_id = int(ing["food_source_id"])
+            food = self.get_food(food_source_id)
+            if not food["default_measure_id"] or not food["nutrients"]:
+                raise RuntimeError(
+                    f"getFood {food_source_id} returned no measure or nutrients"
+                )
+            foods.append((food_source_id, float(ing["grams"]), food))
+
+        # 0.01 * grams, not grams / 100: the web app's rounding, which the
+        # golden test reproduces to the last digit.
+        totals = {
+            nid: sum(f["nutrients"].get(nid, 0.0) * 0.01 * grams
+                     for _, grams, f in foods)
+            for nid in _RECIPE_NUTRIENT_IDS
+            if any(nid in f["nutrients"] for _, _, f in foods)
+        }
+        total_grams = sum(grams for _, grams, _ in foods)
+
+        def _fmt(v: float) -> str:
+            return str(int(v)) if v == int(v) else repr(v)
+
+        # GWT numbers every string and type name once, in the order it is
+        # first written; _s() fills the table as the body is built.
+        table: list[str] = []
+
+        def _s(value: str) -> str:
+            if value not in table:
+                table.append(value)
+            return str(table.index(value) + 1)
+
+        for entry in (
+            "https://cronometer.com/cronometer/", self.gwt_header,
+            "com.cronometer.shared.rpc.CronometerService", "addFood",
+            "java.lang.String/2004016611", "I",
+            "com.cronometer.shared.foods.models.Food/2097636843",
+            "com.cronometer.shared.foods.models.IngredientSubstitutions/"
+            "1892525086",
+        ):
+            _s(entry)
+        food_type = "com.cronometer.shared.foods.models.Food/2097636843"
+        arraylist = "java.util.ArrayList/4159755760"
+        hashmap = "java.util.HashMap/1797211028"
+        string = "java.lang.String/2004016611"
+        measure = "com.cronometer.shared.foods.models.Measure/1979099908"
+        measure_type = (
+            "com.cronometer.shared.foods.models.Measure$Type/2365167904"
+        )
+
+        # Back-references are -(position in the object stream). Each
+        # ingredient is one object, so both move with the ingredient count.
+        n = len(foods)
+        measure_type_ref = -(9 + n)    # Measure$Type, first seen in "full recipe"
+        nutrient_type_ref = -(19 + n)  # Nutrient$Type, first seen in entry 1
+
+        data = [
+            _s(self.nonce or ""), self.user_id, _s(food_type),
+            "0", "0", _s(arraylist), "0", "0",
+            _s(notes) if notes else "0", "0", "0", "0",
+            _s(arraylist), str(n),
+        ]
+        for food_source_id, grams, food in foods:
+            data += [
+                _s("com.cronometer.shared.foods.models.Ingredient/1280520736"),
+                _fmt(grams), str(food_source_id), "A",
+                str(food["default_measure_id"]), "0", "0",
+            ]
+        data += [
+            _s("com.cronometer.shared.foods.NutritionLabelType/1598919019"),
+            "1", "A",
+            _s("com.cronometer.shared.foods.models.FoodMeasures/2106205728"),
+            "0", _s(arraylist), "3",
+        ]
+        # Three measures: "full recipe", one named after the account email
+        # (the web app adds it), and "g" carrying the total weight.
+        data += [
+            _s(measure), "1", "0", "0", "0", "0", "0", _s("full recipe"),
+            _s(hashmap), "0", _s(measure_type), "3", "1",
+            _s(measure), "1", "0", "0", "0", "0", "0", _s(self.username),
+            _s(hashmap), "0", str(measure_type_ref), "1",
+            _s(measure), "1", "0", "0", "0", "0", "0", _s("g"),
+            _s(hashmap), "0", str(measure_type_ref), _fmt(total_grams),
+        ]
+        data += [
+            _s("com.cronometer.shared.foods.models.NutrientMap/168231382"),
+            _s("com.cronometer.shared.foods.models.NutrientMap$"
+               "NutrientFilter/1990310964"),
+            "0", _s(hashmap), str(len(totals)),
+        ]
+        for i, (nid, value) in enumerate(totals.items()):
+            data += [
+                _s("java.lang.Integer/3438268394"), str(nid),
+                _s("com.cronometer.shared.foods.models.Nutrient/331784102"),
+                _fmt(value), str(nid),
+            ]
+            if i == 0:
+                data += [
+                    _s("com.cronometer.shared.foods.models.Nutrient$Type/"
+                       "4187872513"),
+                    "0",
+                ]
+            else:
+                data.append(str(nutrient_type_ref))
+        data += [
+            _s(hashmap), "1", _s(string), _s("advancedServingSize"),
+            _s(string), _s("false"), "0", _s("Custom"),
+            _s("java.util.HashSet/3273092938"), "0", _s(arraylist), "1",
+            _s("com.cronometer.shared.foods.models.Translation/4034452093"),
+            _s("com.cronometer.shared.user.models.Language/1257207975"),
+            _s("en"), _s("English"),
+            _s("https://cdn1.cronometer.com/media/flags/us.png"),
+            _s("English"), _s(name), "0",
+            _s("com.cronometer.shared.foods.FoodType/2323555378"), "1",
+            self.user_id, "0",
+        ]
+
+        body = (
+            f"7|0|{len(table)}|" + "|".join(table) + "|1|2|3|4|4|5|6|7|8|"
+            + "|".join(data) + "|"
+        )
+        raw = self._gwt_post(body)
+        food_source_id = self._parse_add_food(raw)
+
+        logger.info(
+            "Created recipe '%s' (food_source_id %s) from %d ingredients",
+            name, food_source_id, n,
+        )
+        return {
+            "food_source_id": food_source_id,
+            "total_grams": total_grams,
+            "kcal": totals.get(208, 0.0),
+            "protein_g": totals.get(203, 0.0),
+            "carbs_g": totals.get(205, 0.0),
+            "fat_g": totals.get(204, 0.0),
+        }
+
+    @staticmethod
+    def _parse_add_food(raw: str) -> int:
+        """Read the new food_source_id out of an addFood response.
+
+        The response echoes the saved Food. Counting back from the Food type
+        ref (always the last data token), the id is the tenth token: Food,
+        0, 0, barcode list ref, its size, 0, notes ref, 0, 0, id.
+        """
+        data = raw[len("//OK["):raw.rindex(',["')].split(",")
+        if len(data) < 10 or data[-1] != "1" or not data[-10].isdigit():
+            raise RuntimeError(f"addFood response not understood: {raw[:300]}")
+        return int(data[-10])
+
+    def delete_recipe(self, food_source_id: int) -> bool:
+        """Delete a custom food or recipe you created.
+
+        Args:
+            food_source_id: The recipe's id, from create_recipe or search_foods.
+
+        Returns:
+            True on success.
+        """
+        self.authenticate()
+        body = (
+            GWT_DELETE_FOOD
+            .replace("{gwt_header}", self.gwt_header)
+            .replace("{nonce}", self.nonce or "")
+            .replace("{food_source_id}", str(food_source_id))
+        )
+        self._gwt_post(body)
+        return True
 
     def add_serving(
         self,

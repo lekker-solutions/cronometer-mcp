@@ -107,6 +107,8 @@ If you installed from source with `pip install -e .`, you can also use the full 
 | `get_food_details` | Get full nutrition info and serving measure IDs for a food |
 | `add_food_entry` | Add a food entry to the diary |
 | `remove_food_entry` | Remove a food entry from the diary |
+| `create_recipe` | Create a recipe from ingredients (food id or search query, grams) |
+| `delete_recipe` | Delete a recipe or custom food you created |
 | `copy_day` | Copy all diary entries from one date to another |
 | `set_day_complete` | Mark a diary day as complete or incomplete |
 

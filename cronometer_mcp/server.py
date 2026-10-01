@@ -569,6 +569,77 @@ def remove_food_entry(serving_id: str) -> str:
 
 
 @mcp.tool()
+def create_recipe(
+    name: str,
+    ingredients: list[dict],
+    notes: str = "",
+) -> str:
+    """Create a recipe in Cronometer from a list of ingredients.
+
+    Each ingredient is {"food_source_id": int | "query": str, "grams": float}.
+    A query is searched like search_foods and the top hit is used; the result
+    lists what each query matched, so check it. Amounts are always grams (there
+    is no servings parameter): log the recipe by grams or as "full recipe".
+    The result also gives the recipe's total kcal and macros to check against.
+
+    Args:
+        name: Recipe name.
+        ingredients: List of {"food_source_id" or "query", "grams"} objects.
+        notes: Optional recipe notes.
+    """
+    try:
+        client = _get_client()
+        resolved = []
+        for ing in ingredients:
+            entry = {"grams": ing["grams"]}
+            if ing.get("food_source_id"):
+                entry["food_source_id"] = ing["food_source_id"]
+            else:
+                hits = client.find_foods(ing["query"], max_results=1)
+                if not hits:
+                    return json.dumps({
+                        "status": "error",
+                        "message": f"No food found for query '{ing['query']}'",
+                    })
+                entry.update(
+                    food_source_id=hits[0]["food_source_id"],
+                    query=ing["query"],
+                    matched_name=hits[0]["name"],
+                    matched_source=hits[0]["source"],
+                )
+            resolved.append(entry)
+
+        result = client.add_recipe(name, resolved, notes)
+        return json.dumps({
+            "status": "success",
+            "recipe": {"name": name, **result},
+            "ingredients": resolved,
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"status": "error", "message": f"{type(e).__name__}: {e}"})
+
+
+@mcp.tool()
+def delete_recipe(food_source_id: int) -> str:
+    """Delete a recipe (or custom food) you created.
+
+    Args:
+        food_source_id: The recipe's food_source_id, from create_recipe or
+                        search_foods.
+    """
+    try:
+        client = _get_client()
+        client.delete_recipe(food_source_id)
+        return json.dumps({
+            "status": "success",
+            "food_source_id": food_source_id,
+            "message": "Recipe deleted.",
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"status": "error", "message": f"{type(e).__name__}: {e}"})
+
+
+@mcp.tool()
 def get_macro_targets(
     target_date: str | None = None,
 ) -> str:
