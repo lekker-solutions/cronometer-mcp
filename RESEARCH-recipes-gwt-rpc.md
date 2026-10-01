@@ -167,4 +167,24 @@ Not run against a live account yet. The response format is unknown, so `delete_r
 Layout of an entry in the `getFood` data section (GWT writes responses in reverse):
 
 - **Nutrient entry:** `{Nutrient$Type ref or back-ref}, {id}, {amount per 100 g}, {Nutrient ref}, {id}, {Integer ref}`. The amount is a double and always has a decimal point.
-- **Measure:** the `Measure` type ref at `i`, then: `i-1` quantity `1.0`, `i-3` food id, `i-5` measure id, `i-7` description ref. The existing `measures` parser reads the measure id at `i-4`, which is the `0` beside it, so `get_food_details` reports `measure_id` 0 for these responses. Left as it was.
+- **Measure:** the `Measure` type ref at `i`, then: `i-1` quantity `1.0`, `i-2` `0`, `i-3` food id, `i-4` `0`, `i-5` measure id, `i-6` `0`, `i-7` description ref, `i-8` HashMap ref, `i-9` `0`, `i-10` `Measure$Type` ref or back-reference (a fresh ref is followed by an ordinal), and before that the weight float. Checked against oats, egg and the two recipes below. The parser used to read the measure id at `i-4`, so `get_food_details` reported `measure_id` 0.
+
+---
+
+## Logging by grams (`updateDiary`)
+
+Captured from the web app: logging 100 g of the "Black Beans" recipe (food 80188285), and the "SE Asia - Peanut Sauce" recipe (81032187) after switching it to grams. The Serving after the Day ends:
+
+```
+...|1|1|0|0|13|9|54|0|0|100|80188285|A|291079563|0|0
+```
+
+In `GWT_UPDATE_DIARY` the slot after `A` (written `{food_id}`) is the **serving's measure id**, not the food id. 291079563 is Black Beans' `g` measure; the double before the food source id (100) is the amount in that measure.
+
+An earlier live test put the REST `measureId` (308484712, the recipe's default "full recipe" measure) in that slot and the diary showed "100.00 full recipe". So to log by grams, `add_serving` with `measure_id=0` calls `getFood`, finds the measure whose description is `g`, and sends its id there with quantity = weight = grams. A food with no `g` measure keeps sending the food id.
+
+Identify the gram measure by its description, not its weight. For a recipe "full recipe" can be `1.0` and `g` the total grams (Black Beans: `g` 4230.0), but Peanut Sauce has `g` 1.0 and "full recipe" 454.89, so the weights are not consistent.
+
+Left as it was: the encoded diary-group slot (`UNIVERSAL_MEASURE_ID`). The browser sends `0` there plus a `Time` object; the current form works. The change has not been run against a live account; tests mock `getFood`.
+
+Fixtures `getfood_80188285.txt` and `getfood_81032187.txt` are the two `getFood` responses with the nonce and user id replaced by `{nonce}` and `{user_id}`.

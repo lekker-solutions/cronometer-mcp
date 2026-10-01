@@ -764,6 +764,7 @@ def _build_get_food_response(measures: list[dict], include_derived: bool = False
         "com.cronometer.shared.foods.models.Food/1234567890",
         "com.cronometer.shared.foods.models.Measure/2345678901",
         "com.cronometer.shared.foods.models.Measure$Type/3456789012",
+        "java.util.HashMap/1797211028",
     ]
     if include_derived:
         class_names.append(
@@ -781,6 +782,7 @@ def _build_get_food_response(measures: list[dict], include_derived: bool = False
 
     measure_type_idx = 2  # Measure class is at index 2 (1-based)
     measure_subtype_idx = 3  # Measure$Type
+    hashmap_idx = 4
 
     # Build data tokens: some food metadata, then Measure objects.
     # Food metadata prefix (simplified): string_table_size, 0, food_type_ref=1
@@ -788,18 +790,21 @@ def _build_get_food_response(measures: list[dict], include_derived: bool = False
 
     for m in measures:
         desc_ref = _intern(m["description"])
-        # Layout: weight_grams, ..., Measure$Type ref, ...,
-        #         desc_ref, 0, measure_id, food_source_id, 0, 1.0, Measure type ref
+        # Layout as in a real response: weight_grams, Measure$Type ref,
+        # ordinal, 0, HashMap ref, description ref, 0, measure_id, 0,
+        # food_source_id, 0, 1.0, Measure type ref
         data_tokens += [
             m["weight_grams"],      # weight_grams (float)
-            0,                       # padding
-            measure_subtype_idx,     # Measure$Type ref
-            0,                       # ordinal
-            desc_ref,                # description (i-6 from Measure type ref)
-            0,                       # flags (i-5)
-            m["measure_id"],         # measure_id (i-4)
+            measure_subtype_idx,     # Measure$Type ref (i-10)
+            3,                       # ordinal
+            0,                       # (i-9)
+            hashmap_idx,             # HashMap ref (i-8)
+            desc_ref,                # description (i-7)
+            0,                       # (i-6)
+            m["measure_id"],         # measure_id (i-5)
+            0,                       # (i-4)
             m["food_source_id"],     # food_source_id (i-3)
-            0,                       # flags (i-2)
+            0,                       # (i-2)
             1.0,                     # quantity (i-1)
             measure_type_idx,        # Measure type ref (i)
         ]
@@ -807,8 +812,8 @@ def _build_get_food_response(measures: list[dict], include_derived: bool = False
     if include_derived:
         derived_type_idx = len(class_names)  # 1-based
         data_tokens += [
-            100.0, 0, measure_subtype_idx, 0,
-            _intern("mL"), 0, 999999, 12345, 0, 1.0,
+            100.0, measure_subtype_idx, 3, 0, hashmap_idx,
+            _intern("mL"), 0, 999999, 0, 12345, 0, 1.0,
             derived_type_idx,
         ]
 
@@ -996,6 +1001,61 @@ class TestAddServing:
         call_body = c.session.post.call_args[1].get("data") or c.session.post.call_args[0][1]
         # Should contain "170|" not "170.0|"
         assert "170|" in call_body
+
+
+class TestAddServingByGrams:
+    """measure_id=0 logs by grams: the food's "g" measure id goes in the
+    slot after "A" (captured: Black Beans, 100 g, measure 291079563)."""
+
+    def _add(self, measures, **kwargs):
+        c = TestAddServing()._make_client()
+        resp = TestAddServing()._mock_update_response(
+            food_id=80188285, fsid=80188285
+        )
+        c.session.post = MagicMock(
+            return_value=MagicMock(text=resp, raise_for_status=lambda: None)
+        )
+        with patch.object(
+            c, "get_food", return_value={"measures": measures}
+        ) as gf:
+            c.add_serving(
+                food_id=80188285, food_source_id=80188285, measure_id=0,
+                quantity=1, weight_grams=100, day=date(2026, 10, 1), **kwargs,
+            )
+        body = c.session.post.call_args[1].get("data") or c.session.post.call_args[0][1]
+        return body, gf
+
+    BEANS = [
+        {"measure_id": 291079564, "description": "Serving", "weight_grams": 1.0},
+        {"measure_id": 291079563, "description": "g", "weight_grams": 0.0},
+    ]
+
+    def test_gram_measure_id_replaces_food_id(self):
+        body, gf = self._add(self.BEANS)
+        gf.assert_called_once_with(80188285)
+        assert "|100|80188285|A|291079563|0|1|" in body
+        assert "|A|80188285|" not in body
+
+    def test_quantity_is_grams(self):
+        body, _ = self._add(self.BEANS)
+        assert "|100|1|0|" in body  # quantity 100, diary group 1
+
+    def test_no_gram_measure_keeps_food_id(self):
+        body, _ = self._add([self.BEANS[0]])
+        assert "|A|80188285|0|1|" in body
+
+    def test_explicit_measure_does_not_look_up_food(self):
+        c = TestAddServing()._make_client()
+        c.session.post = MagicMock(return_value=MagicMock(
+            text=TestAddServing()._mock_update_response(),
+            raise_for_status=lambda: None,
+        ))
+        with patch.object(c, "get_food") as gf:
+            c.add_serving(
+                food_id=502518, food_source_id=55985, measure_id=65541,
+                quantity=4, weight_grams=200, day=date(2026, 3, 5),
+            )
+        gf.assert_not_called()
 
 
 class TestRemoveServing:
@@ -1959,6 +2019,38 @@ class TestParseGetFoodRecipeFields:
         r = CronometerClient._parse_get_food("//EX[error]", 1)
         assert r["default_measure_id"] is None
         assert r["nutrients"] == {}
+
+
+def _measure_ids(fixture: str, fsid: int) -> dict[str, int]:
+    r = CronometerClient._parse_get_food(_fixture(fixture), fsid)
+    return {m["description"]: m["measure_id"] for m in r["measures"]}
+
+
+class TestParseGetFoodMeasureIds:
+    """Measure ids and descriptions, against real getFood responses."""
+
+    def test_oats(self):
+        assert _measure_ids("getfood_464877.txt", 464877) == {
+            "g": 1073268, "tsp": 1073264, "tbsp": 1073265, "oz": 1081478,
+            "Serving": 9759426, "cup": 1073266,
+        }
+
+    def test_egg(self):
+        ids = _measure_ids("getfood_464674.txt", 464674)
+        assert len(ids) == 12
+        assert ids["g"] == 1072109
+        assert ids["large"] == 1072101
+
+    def test_black_beans_recipe(self):
+        assert _measure_ids("getfood_80188285.txt", 80188285) == {
+            "Serving": 291079564, "full recipe": 291079562, "g": 291079563,
+        }
+
+    def test_peanut_sauce_recipe(self):
+        assert _measure_ids("getfood_81032187.txt", 81032187) == {
+            "g": 294784035, "oz": 294784034, "Serving": 294784033,
+            "full recipe": 294784036,
+        }
 
 
 class TestDeleteRecipe:

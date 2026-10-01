@@ -497,19 +497,20 @@ def add_food_entry(
     Use search_foods to find food_id and food_source_id, then
     get_food_details for measure_id and weight_grams.
 
-    For CRDB/custom foods, you can omit measure_id (defaults to a
-    universal NCCDB measure that works for all food sources).
-    When measure_id is omitted, quantity is set to weight_grams.
+    Omit measure_id to log by grams, which works for every food and is
+    the right choice for recipes: the food's "g" measure is looked up
+    and quantity is set to weight_grams. Pass a measure_id from
+    get_food_details only to log in another unit (cups, "large", ...).
+    A food with no "g" measure falls back to a universal measure.
 
     Args:
         food_id: Numeric food ID from search_foods results.
         food_source_id: Food source ID from search_foods results.
         weight_grams: Weight of the serving in grams.
         date: Date to log the entry as YYYY-MM-DD (e.g. "2026-03-04").
-        measure_id: Measure/unit ID. Pass 0 (default) to use the universal
-                    measure that works for all food sources.
-        quantity: Number of servings. Defaults to weight_grams when
-                  measure_id is 0 (universal gram-based measure).
+        measure_id: Measure/unit ID. Pass 0 (default) to log by grams.
+        quantity: Number of servings in that measure. Set to weight_grams
+                  when measure_id is 0.
         diary_group: Diary group name (case-insensitive) or 0-based index.
                      Names are user-configured and are not always
                      Breakfast/Lunch/Dinner/Snacks — call list_diary_groups to

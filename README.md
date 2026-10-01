@@ -167,7 +167,7 @@ Key parameter patterns:
   indices are rejected rather than silently defaulting — Cronometer itself
   accepts a bad index without complaint and the entry becomes unreachable.
 - `days_of_week` — `"all"`, `"weekdays"`, `"weekends"`, or comma-separated day numbers (`0`=Sun through `6`=Sat)
-- `measure_id` — pass `0` to use the universal gram-based measure (works for all food sources)
+- `measure_id` — pass `0` to log by grams (the food's "g" measure; works for recipes and all food sources)
 - `target_date` — pass `"all"` on `get_macro_targets` to get the full weekly schedule
 
 ### Sync Output

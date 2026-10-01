@@ -1129,11 +1129,12 @@ class CronometerClient:
         The response contains food metadata and a list of Measure objects.
         Each Measure has fields (reading backwards from the Measure type ref):
 
-            i-6  description_ref (1-based string table index)
-            i-5  flags (0)
-            i-4  measure_id (integer, the key value needed by add_serving)
+            i-7  description_ref (1-based string table index)
+            i-6  0
+            i-5  measure_id (integer)
+            i-4  0
             i-3  food_source_id
-            i-2  flags (0)
+            i-2  0
             i-1  quantity (1.0)
             i    <Measure type ref>
 
@@ -1211,9 +1212,11 @@ class CronometerClient:
             if i < 6:
                 continue
 
-            measure_id_val = tokens[i - 4]
+            measure_id_val = tokens[i - 5]
 
-            if not isinstance(measure_id_val, int):
+            # Other tokens equal to the Measure type ref are not measures;
+            # a real one is always preceded by the quantity 1.0.
+            if not isinstance(measure_id_val, int) or tokens[i - 1] != 1.0:
                 continue
 
             # Description ref is at i-6 for standard Measure layout, but
@@ -1234,10 +1237,11 @@ class CronometerClient:
                         break
 
             # Find weight_grams: it's the float that appears before the
-            # Measure$Type ref/back-ref, which is at i-7 or i-8.
+            # Measure$Type ref/back-ref (i-10; a fresh ref is followed by an
+            # ordinal, which puts the weight at i-12).
             # Scan backwards from i-7 to find the first float.
             weight_grams = 0.0
-            for j in range(i - 7, max(i - 12, -1), -1):
+            for j in range(i - 7, max(i - 13, -1), -1):
                 if isinstance(tokens[j], float):
                     weight_grams = tokens[j]
                     break
@@ -1492,11 +1496,15 @@ class CronometerClient:
             food_id: Numeric food ID from Cronometer's food database.
             food_source_id: Food source ID (identifies the database the food
                            comes from, e.g. USDA, custom).
-            measure_id: Measure/unit ID. Pass 0 to auto-select
-                        UNIVERSAL_MEASURE_ID (124399). The diary_group is
+            measure_id: Measure/unit ID. Pass 0 to log by grams: the food's
+                        "g" measure is looked up with get_food and sent as
+                        the serving's measure (the browser does the same,
+                        and it is what makes a recipe show as grams rather
+                        than "full recipe"). The diary_group slot gets
+                        UNIVERSAL_MEASURE_ID (124399), with the group
                         encoded into the high 16 bits automatically.
-            quantity: Serving quantity. When using UNIVERSAL_MEASURE_ID, set
-                      this equal to weight_grams (since the measure is g-based).
+            quantity: Serving quantity. When measure_id is 0 and a "g"
+                      measure is found, weight_grams is used instead.
             weight_grams: Weight of the serving in grams.
             day: Calendar date to log the entry against.
             diary_group: Meal slot — 1=Breakfast, 2=Lunch, 3=Dinner, 4=Snacks.
@@ -1509,8 +1517,20 @@ class CronometerClient:
         """
         self.authenticate()
 
+        # The slot after "A" holds the serving's measure id. Logging by
+        # grams needs the food's own "g" measure there; without a "g"
+        # measure it keeps the food id as before.
+        serving_measure_slot = food_id
         if measure_id == 0:
             measure_id = UNIVERSAL_MEASURE_ID
+            gram_measure = next(
+                (m for m in self.get_food(food_source_id)["measures"]
+                 if m["description"] == "g" and m["measure_id"]),
+                None,
+            )
+            if gram_measure:
+                serving_measure_slot = gram_measure["measure_id"]
+                quantity = weight_grams
 
         # Encode diary_group into the measure_id's high 16 bits.
         # The Cronometer server reads the diary group from this encoding:
@@ -1536,7 +1556,7 @@ class CronometerClient:
             .replace("{measure_id}", str(encoded_measure))
             .replace("{weight_grams}", weight_str)
             .replace("{food_source_id}", str(food_source_id))
-            .replace("{food_id}", str(food_id))
+            .replace("{food_id}", str(serving_measure_slot))
         )
 
         raw = self._gwt_post(body)
